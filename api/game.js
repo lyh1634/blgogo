@@ -1,21 +1,24 @@
-// api/game.js - 使用原生 fetch（Node.js 18+ 自带）
-export default async function handler(req, res) {
+// api/game.js - CommonJS 版本（兼容性最好）
+module.exports = async function handler(req, res) {
   // 处理 CORS 预检
   if (req.method === 'OPTIONS') {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    return res.status(200).end();
+    res.status(200).end();
+    return;
   }
 
   if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method Not Allowed' });
+    res.status(405).json({ error: 'Method Not Allowed' });
+    return;
   }
 
   try {
     const gameState = req.body;
     const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
     if (!DEEPSEEK_API_KEY) {
-      return res.status(500).json({ error: '缺少 DEEPSEEK_API_KEY 环境变量' });
+      res.status(500).json({ error: '缺少 DEEPSEEK_API_KEY 环境变量' });
+      return;
     }
 
     // 调用 DeepSeek API
@@ -28,8 +31,14 @@ export default async function handler(req, res) {
       body: JSON.stringify({
         model: 'deepseek-chat',
         messages: [
-          { role: 'system', content: '你是一个 BL 恋爱游戏叙事引擎，请返回 JSON 格式的剧情和数值变化。' },
-          { role: 'user', content: JSON.stringify(gameState) }
+          {
+            role: 'system',
+            content: '你是一个 BL 恋爱游戏叙事引擎，请严格返回 JSON 格式，包含 story_text、stats_update、choices 三个字段。'
+          },
+          {
+            role: 'user',
+            content: JSON.stringify(gameState)
+          }
         ],
         temperature: 0.8,
         response_format: { type: 'json_object' }
@@ -40,11 +49,10 @@ export default async function handler(req, res) {
     const content = data.choices[0].message.content;
     const parsed = JSON.parse(content);
 
-    // 返回给前端
     res.setHeader('Access-Control-Allow-Origin', '*');
-    return res.status(200).json(parsed);
+    res.status(200).json(parsed);
   } catch (error) {
-    console.error(error);
-    return res.status(500).json({ error: '服务器内部错误' });
+    console.error('Error:', error);
+    res.status(500).json({ error: '服务器内部错误: ' + error.message });
   }
-}
+};
