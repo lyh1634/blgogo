@@ -1,6 +1,5 @@
-// api/game.js - 完整游戏逻辑后端
-// 支持 action: init, step, shop, buy
-// 依赖环境变量 DEEPSEEK_API_KEY
+// api/game.js
+// BL恋爱游戏《上帝之手》后端 - 系统辅助主角与攻略角色恋爱
 
 module.exports = async (req, res) => {
   // CORS 头
@@ -18,32 +17,25 @@ module.exports = async (req, res) => {
   }
 
   try {
-    const body = req.body;
-    const action = body.action;
+    const { action, ...state } = req.body;
 
-    // 初始化
     if (action === 'init') {
-      const initState = await initGame(body);
+      const initState = await initGame(state);
       return res.status(200).json(initState);
     }
-    // 推进剧情
-    else if (action === 'step') {
-      const newState = await stepGame(body);
+    if (action === 'step') {
+      const newState = await stepGame(state);
       return res.status(200).json(newState);
     }
-    // 商店列表
-    else if (action === 'shop') {
+    if (action === 'shop') {
       const shopItems = getShopItems();
       return res.status(200).json({ shopItems });
     }
-    // 购买道具
-    else if (action === 'buy') {
-      const newState = await buyItem(body);
+    if (action === 'buy') {
+      const newState = await buyItem(state);
       return res.status(200).json(newState);
     }
-    else {
-      return res.status(400).json({ error: 'Unknown action' });
-    }
+    return res.status(400).json({ error: '未知 action' });
   } catch (err) {
     console.error('API Error:', err);
     res.status(500).json({ error: '服务器内部错误: ' + err.message });
@@ -54,36 +46,55 @@ module.exports = async (req, res) => {
 async function initGame(data) {
   const { protagonist: proto, loveInterests: loveList, world } = data;
 
-  // 生成主角完整信息（包括性格、喜好雷区等）
-  const protagonist = generateCharacter(proto, true);
+  // 生成主角完整信息
+  const protagonist = {
+    name: proto.name,
+    group: proto.group || '',
+    birthday: proto.birthday || '',
+    mbti: proto.mbti || 'INFP',
+    health: 100,
+    mood: 70,
+    trust: 25,      // 主角对玩家的信任度
+    friendship: 15, // 主角与玩家的友情值
+  };
 
-  // 生成攻略角色完整信息
-  const loveInterests = loveList.map(li => generateCharacter(li, false));
+  // 生成攻略角色（初始好感度 20±5，妒忌值 0）
+  const loveInterests = loveList.map(li => ({
+    name: li.name,
+    group: li.group || '',
+    birthday: li.birthday || '',
+    mbti: li.mbti || 'ENFJ',
+    favorability: 20 + Math.floor(Math.random() * 10) - 5, // 15~25
+    jealousy: 0,
+    likes: generateLikes(li.mbti),
+    dislikes: generateDislikes(li.mbti),
+  }));
 
-  // 副本特殊初始值
+  // 副本特殊进度
   let specialProgress = 0;
-  let specialValueName = '';
-  if (world.includes('哨向导')) specialValueName = '武力值';
-  else if (world.includes('电竞')) specialValueName = '游戏实力';
-  else if (world.includes('末世')) specialValueName = '基建进度';
-  else if (world.includes('换乘')) specialValueName = '拍摄进度';
-  else if (world.includes('规则怪谈')) specialValueName = '武力值';
+  let specialName = '';
+  if (world.includes('哨向导')) specialName = '武力值';
+  else if (world.includes('电竞')) specialName = '游戏实力';
+  else if (world.includes('末世')) specialName = '基建进度';
+  else if (world.includes('换乘')) specialName = '拍摄进度';
+  else if (world.includes('规则怪谈')) specialName = '武力值';
 
   // 初始剧情
-  const initStory = `「${world}」\n\n你作为系统，将主角${protagonist.name}传送至副本世界。\n周围的环境逐渐清晰……${getWorldIntro(world)}`;
+  const storyText = `【${world}】\n\n作为系统，你将主角${protagonist.name}传送至副本世界。\n${getWorldIntro(world)}\n\n你现在可以通过「系统建议」引导主角的行动。`;
+  const choices = generateInitialChoices(world);
 
   return {
     protagonist,
     loveInterests,
     world,
-    storyText: initStory,
-    choices: generateInitialChoices(world),
-    missionHint: getMissionHint(world),
+    storyText,
+    choices,
+    missionHint: getMissionHint(world, specialProgress),
     specialProgress,
-    specialValueName,
+    specialName,
     gameOver: false,
     gameOverReason: '',
-    storyHistory: initStory,
+    storyHistory: storyText,
     // 副本触发标志
     finalBattleTriggered: false,
     finalBattleCountdown: 0,
@@ -95,40 +106,45 @@ async function initGame(data) {
 // ---------- 剧情推进 ----------
 async function stepGame(state) {
   let newState = JSON.parse(JSON.stringify(state));
-  const { protagonist, loveInterests, world, storyHistory, lastChoice, specialProgress } = newState;
+  const { protagonist, loveInterests, world, storyHistory, lastChoice, specialProgress, specialName } = newState;
 
-  // 1. 调用 DeepSeek 生成剧情和数值建议
-  const aiResponse = await callDeepSeek(newState);
+  // 调用 DeepSeek 生成剧情和数值建议
+  let aiResponse;
+  try {
+    aiResponse = await callDeepSeek(newState);
+  } catch (err) {
+    console.error('DeepSeek 调用失败，使用模拟响应', err);
+    aiResponse = getMockResponse(newState);
+  }
+
   const { story_text, stats_update, choices } = aiResponse;
 
-  // 2. 应用数值变化
+  // 应用数值变化
   if (stats_update) {
-    if (stats_update.protagonist_health) protagonist.health = clamp(protagonist.health + stats_update.protagonist_health, 0, 100);
-    if (stats_update.protagonist_mood) protagonist.mood = clamp(protagonist.mood + stats_update.protagonist_mood, 0, 100);
-    if (stats_update.system_trust) protagonist.trust = clamp(protagonist.trust + stats_update.system_trust, 0, 100);
+    if (stats_update.health) protagonist.health = clamp(protagonist.health + stats_update.health, 0, 100);
+    if (stats_update.mood) protagonist.mood = clamp(protagonist.mood + stats_update.mood, 0, 100);
+    if (stats_update.trust) protagonist.trust = clamp(protagonist.trust + stats_update.trust, 0, 100);
     if (stats_update.friendship) protagonist.friendship = clamp(protagonist.friendship + stats_update.friendship, 0, 100);
-    if (stats_update.special_progress) newState.specialProgress = clamp(newState.specialProgress + stats_update.special_progress, 0, 100);
+    if (stats_update.special) newState.specialProgress = clamp(newState.specialProgress + stats_update.special, 0, 100);
 
-    // 好感度/妒忌值变化
-    if (stats_update.favorability_changes) {
-      stats_update.favorability_changes.forEach(change => {
+    // 好感度变化
+    if (stats_update.favorability) {
+      for (let change of stats_update.favorability) {
         const target = loveInterests.find(li => li.name === change.name);
-        if (target) {
-          target.favorability = clamp(target.favorability + change.delta, 0, 100);
-        }
-      });
+        if (target) target.favorability = clamp(target.favorability + change.delta, 0, 100);
+      }
     }
-    if (stats_update.jealousy_changes) {
-      stats_update.jealousy_changes.forEach(change => {
+    // 妒忌值变化
+    if (stats_update.jealousy) {
+      for (let change of stats_update.jealousy) {
         const target = loveInterests.find(li => li.name === change.name);
-        if (target) {
-          target.jealousy = clamp(target.jealousy + change.delta, 0, 100);
-        }
-      });
+        if (target) target.jealousy = clamp(target.jealousy + change.delta, 0, 100);
+      }
     }
   }
 
-  // 3. 副本任务触发检查（好感度70触发倒计时）
+  // 检查好感度触发关系阶段（用于前端显示，这里只是更新，前端会重新渲染）
+  // 副本任务触发：任意攻略角色好感度 ≥ 70
   const maxFavor = Math.max(...loveInterests.map(li => li.favorability));
   if (!newState.finalBattleTriggered && maxFavor >= 70 && world.includes('哨向导')) {
     newState.finalBattleTriggered = true;
@@ -141,7 +157,7 @@ async function stepGame(state) {
     newState.missionHint = `🏆 全球总决赛 ${newState.worldsCountdown} 天后开战！`;
   }
 
-  // 4. 副本任务完成判定
+  // 副本任务完成判定（换乘：拍摄进度≥21；末世：基建进度≥100）
   if (world.includes('换乘') && newState.specialProgress >= 21) {
     newState.gameOver = true;
     newState.gameOverReason = '节目录制完成，你选择了新的开始。副本通关！';
@@ -150,27 +166,8 @@ async function stepGame(state) {
     newState.gameOver = true;
     newState.gameOverReason = '基地建设完成，人类找到了希望。副本通关！';
   }
-  if (world.includes('哨向导') && newState.finalBattleTriggered && newState.finalBattleCountdown <= 0) {
-    // 最终战役结算
-    if (protagonist.health >= 60 && (protagonist.specialValue || 80) >= 90) {
-      newState.gameOver = true;
-      newState.gameOverReason = '战役胜利！你成为了英雄。副本通关！';
-    } else {
-      newState.gameOver = true;
-      newState.gameOverReason = '你在最终战役中牺牲了... BE';
-    }
-  }
-  if (world.includes('电竞') && newState.worldsTriggered && newState.worldsCountdown <= 0) {
-    if (protagonist.health >= 60 && (protagonist.specialValue || 80) >= 90) {
-      newState.gameOver = true;
-      newState.gameOverReason = '你们捧起了召唤师奖杯！副本通关！';
-    } else {
-      newState.gameOver = true;
-      newState.gameOverReason = '错失了冠军... BE';
-    }
-  }
-
-  // 5. 健康值过低结束
+  // 哨向/电竞的最终战役/总决赛倒计时结束时的结算（需要在倒计时为0时触发，这里简化：由前端在倒计时归零时发step触发）
+  // 健康值过低结束
   if (protagonist.health <= 5) {
     newState.gameOver = true;
     newState.gameOverReason = '主角健康值耗尽，未能撑到最后。';
@@ -178,7 +175,6 @@ async function stepGame(state) {
 
   newState.storyText = story_text;
   newState.choices = choices;
-  // 更新剧情历史
   newState.storyHistory = (newState.storyHistory ? newState.storyHistory + '\n\n' + story_text : story_text);
   if (newState.storyHistory.length > 8000) newState.storyHistory = newState.storyHistory.slice(-8000);
 
@@ -213,56 +209,40 @@ async function buyItem(state) {
   } else if (itemId === 'mood_boost') {
     newState.protagonist.mood = clamp(newState.protagonist.mood + 20, 0, 100);
   }
-  // 添加购买提示剧情（可选）
   newState.storyText = `【道具使用】${costCharacter}消耗了${costValue}好感度，换来了「${getShopItems().find(i=>i.id===itemId)?.name}」。\n\n` + (newState.storyText || '');
   return newState;
 }
 
 // ---------- 辅助函数 ----------
-function clamp(val, min, max) {
-  return Math.min(max, Math.max(min, val));
-}
+function clamp(val, min, max) { return Math.min(max, Math.max(min, val)); }
 
-function generateCharacter(base, isProtagonist) {
-  // 根据生日/MBTI简单生成性格关键词、喜好、雷区（实际可以调用LLM或更细致规则）
-  const mbtiMap = {
-    INFP: { likes: ['真诚', '艺术', '安静陪伴'], dislikes: ['虚伪', '暴力', '强迫'] },
-    ENTP: { likes: ['辩论', '新奇', '挑战'], dislikes: ['无聊', '守旧', '被束缚'] },
-    ENFJ: { likes: ['帮助他人', '社交', '肯定'], dislikes: ['冷漠', '不公', '背叛'] },
-    ISTP: { likes: ['动手', '独立', '刺激'], dislikes: ['啰嗦', '情绪化', '规则'] },
-    INTJ: { likes: ['战略', '深度', '效率'], dislikes: ['肤浅', '打扰', '混乱'] },
-    ESFJ: { likes: ['照顾', '和谐', '传统'], dislikes: ['冲突', '冷漠', '变化'] },
-    ISFP: { likes: ['美', '自由', '感官体验'], dislikes: ['控制', '压力', '评判'] },
-    ENTJ: { likes: ['领导', '成就', '挑战'], dislikes: ['无能', '拖延', '软弱'] },
-    ENFP: { likes: ['探索', '可能性', '热情'], dislikes: ['例行公事', '批评', '束缚'] },
+function generateLikes(mbti) {
+  const map = {
+    INFP: '真诚、艺术、安静陪伴',
+    ENTP: '辩论、新奇、挑战',
+    ENFJ: '帮助他人、社交、肯定',
+    ISTP: '动手、独立、刺激',
+    INTJ: '战略、深度、效率',
+    ESFJ: '照顾、和谐、传统',
+    ISFP: '美、自由、感官体验',
+    ENTJ: '领导、成就、挑战',
+    ENFP: '探索、可能性、热情',
   };
-  const mbti = base.mbti || 'INFP';
-  const profile = mbtiMap[mbti] || { likes: ['温柔', '理解'], dislikes: ['冷漠', '背叛'] };
-  const name = base.name;
-  const group = base.group || '';
-  const birthday = base.birthday || '2000-01-01';
-  const char = {
-    name,
-    group,
-    birthday,
-    mbti,
-    health: 100,
-    mood: 70,
-    trust: isProtagonist ? 25 : 0,
-    friendship: isProtagonist ? 15 : 0,
-    favorability: isProtagonist ? undefined : 20,
-    jealousy: isProtagonist ? undefined : 0,
-    likes: profile.likes.join('、'),
-    dislikes: profile.dislikes.join('、'),
-    specialValue: isProtagonist ? (Math.floor(Math.random() * 20) + 80) : undefined,
+  return map[mbti] || '温柔、理解、陪伴';
+}
+function generateDislikes(mbti) {
+  const map = {
+    INFP: '虚伪、暴力、强迫',
+    ENTP: '无聊、守旧、被束缚',
+    ENFJ: '冷漠、不公、背叛',
+    ISTP: '啰嗦、情绪化、规则',
+    INTJ: '肤浅、打扰、混乱',
+    ESFJ: '冲突、冷漠、变化',
+    ISFP: '控制、压力、评判',
+    ENTJ: '无能、拖延、软弱',
+    ENFP: '例行公事、批评、束缚',
   };
-  if (!isProtagonist) {
-    delete char.health;
-    delete char.mood;
-    delete char.trust;
-    delete char.friendship;
-  }
-  return char;
+  return map[mbti] || '冷漠、背叛、强迫';
 }
 
 function getWorldIntro(world) {
@@ -274,11 +254,11 @@ function getWorldIntro(world) {
   return '副本世界加载完成。';
 }
 
-function getMissionHint(world) {
+function getMissionHint(world, progress) {
   if (world.includes('哨向导')) return '最终战役尚未触发';
   if (world.includes('电竞')) return '全球总决赛尚未触发';
-  if (world.includes('末世')) return '建设安全基地 0%';
-  if (world.includes('换乘')) return '拍摄第1/21天';
+  if (world.includes('末世')) return `建设安全基地 ${progress}%`;
+  if (world.includes('换乘')) return `拍摄第${progress}/21天`;
   if (world.includes('规则怪谈')) return '找出刺杀国王的方法';
   return '探索副本';
 }
@@ -297,12 +277,43 @@ function generateInitialChoices(world) {
 async function callDeepSeek(gameState) {
   const apiKey = process.env.DEEPSEEK_API_KEY;
   if (!apiKey) {
-    // 没有 key 时返回模拟数据（保证能测试）
+    console.warn('未设置 DEEPSEEK_API_KEY，使用模拟响应');
     return getMockResponse(gameState);
   }
 
-  const systemPrompt = buildSystemPrompt(gameState);
-  const userPrompt = buildUserPrompt(gameState);
+  const systemPrompt = `你是BL恋爱游戏《上帝之手》的叙事引擎。玩家是「系统」，主角是爱豆（男性），攻略角色也是男性爱豆。玩家通过「系统建议」影响主角，但对话和互动发生在主角与攻略角色之间。
+
+当前副本：${gameState.world}
+
+主角信息：${gameState.protagonist.name}（${gameState.protagonist.mbti}）
+攻略角色列表：${gameState.loveInterests.map(l => l.name).join('、')}
+
+你必须以JSON格式返回，包含：
+{
+  "story_text": "剧情描述（200~400字），以主角视角或上帝视角，展现主角与攻略角色的互动。不要提及“系统”或“玩家”，除非是系统建议内容自然融入。",
+  "stats_update": {
+    "health": 整数（-15~+15）,
+    "mood": 整数（-15~+15）,
+    "trust": 整数（-5~+10）,
+    "friendship": 整数（-5~+10）,
+    "special": 整数（0~+10，副本特殊进度增量）,
+    "favorability": [{"name": "攻略角色名", "delta": 整数（-5~+10）}],
+    "jealousy": [{"name": "攻略角色名", "delta": 整数（-3~+12）}]
+  },
+  "choices": ["【系统建议】...", "【保持沉默】...", "【介入】...", "选项D"]
+}
+
+注意：
+- 选项必须从「系统」视角给出，例如“【系统建议】主动邀请他训练”、“【保持沉默】让主角自己决定”。
+- 剧情中主角与攻略角色可以暧昧、互动，但保持BL风格。
+- 数值变化需合理：选择靠近攻略角色会增加好感，选择回避可能降低。`;
+
+  const userPrompt = `【当前剧情摘要】${(gameState.storyHistory || '').slice(-400)}
+【上一轮玩家选择】${gameState.lastChoice || '无'}
+【主角状态】健康${gameState.protagonist.health}，心情${gameState.protagonist.mood}，信任${gameState.protagonist.trust}，友情${gameState.protagonist.friendship}
+【攻略角色状态】${gameState.loveInterests.map(l => `${l.name}: 好感${l.favorability}, 妒忌${l.jealousy}`).join('；')}
+【副本特殊进度】${gameState.specialName || '进度'}: ${gameState.specialProgress}
+请生成下一段剧情和数值变化。`;
 
   const response = await fetch('https://api.deepseek.com/v1/chat/completions', {
     method: 'POST',
@@ -322,89 +333,34 @@ async function callDeepSeek(gameState) {
   });
 
   if (!response.ok) {
-    console.error('DeepSeek API error:', response.status);
-    return getMockResponse(gameState);
+    throw new Error(`DeepSeek API error: ${response.status}`);
   }
-
   const data = await response.json();
   const content = data.choices[0].message.content;
-  try {
-    return JSON.parse(content);
-  } catch (e) {
-    console.error('JSON parse error:', e);
-    return getMockResponse(gameState);
-  }
+  return JSON.parse(content);
 }
 
-function buildSystemPrompt(state) {
-  const { protagonist, loveInterests, world } = state;
-  const loveNames = loveInterests.map(li => li.name).join('、');
-  return `你是一个BL恋爱游戏《上帝之手》的叙事引擎。当前副本：${world}。
-主角：${protagonist.name}（${protagonist.mbti}），你作为系统辅助他。
-攻略角色：${loveNames}。
-你需要生成下一段剧情，并根据玩家选择更新以下数值：
-- protagonist_health (-15~+15)
-- protagonist_mood (-15~+15)
-- system_trust (-5~+10)
-- friendship (-5~+10)
-- special_progress (0~+10，副本特殊进度)
-- favorability_changes: 数组，每项 { name, delta } (-5~+10)
-- jealousy_changes: 数组，每项 { name, delta } (-3~+12)
-
-剧情要求：200~400字，BL风格，符合当前好感度阶段，包含对话和心理描写。
-返回JSON格式：
-{
-  "story_text": "...",
-  "stats_update": { ... },
-  "choices": ["选项A", "选项B", "选项C", "选项D"]
-}
-注意：选项必须从玩家（系统）视角给出，如“【系统建议】...”、“【保持沉默】...”等。
-`;
-}
-
-function buildUserPrompt(state) {
-  const { protagonist, loveInterests, world, storyHistory, lastChoice, specialProgress } = state;
-  const loveStatus = loveInterests.map(li => `${li.name}（好感${li.favorability}，妒忌${li.jealousy}）`).join('；');
-  return `【当前剧情】
-${storyHistory.slice(-500)}
-
-【玩家上一轮选择】
-${lastChoice || '无'}
-
-【主角状态】
-健康值：${protagonist.health}，心情值：${protagonist.mood}
-信任值：${protagonist.trust}，友情值：${protagonist.friendship}
-${world.includes('哨向导') ? `武力值：${protagonist.specialValue || 80}` : ''}
-${world.includes('电竞') ? `游戏实力：${protagonist.specialValue || 80}` : ''}
-${world.includes('末世') ? `基建进度：${specialProgress}%` : ''}
-${world.includes('换乘') ? `拍摄进度：${specialProgress}/21天` : ''}
-
-【攻略角色状态】
-${loveStatus}
-
-请根据以上信息生成下一段剧情、数值变化和4个新选项。`;
-}
-
+// 模拟响应（当 API Key 缺失或调用失败时使用）
 function getMockResponse(state) {
   const { protagonist, loveInterests, world } = state;
-  const randomDelta = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
-  const favorChanges = loveInterests.map(li => ({ name: li.name, delta: randomDelta(-2, 5) }));
-  const jealChanges = loveInterests.map(li => ({ name: li.name, delta: randomDelta(-1, 3) }));
+  const delta = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+  const favorChanges = loveInterests.map(li => ({ name: li.name, delta: delta(-2, 5) }));
+  const jealChanges = loveInterests.map(li => ({ name: li.name, delta: delta(-1, 3) }));
   return {
-    story_text: `【模拟剧情】你在${world}中继续前行。${protagonist.name}感到周围的气息变化，似乎有人正注视着他。`,
+    story_text: `【模拟剧情】在${world}中，${protagonist.name}与${loveInterests[0]?.name || '攻略角色'}相遇。空气中弥漫着微妙的氛围。`,
     stats_update: {
-      protagonist_health: randomDelta(-2, 2),
-      protagonist_mood: randomDelta(-3, 5),
-      system_trust: randomDelta(-1, 3),
-      friendship: randomDelta(-1, 2),
-      special_progress: randomDelta(0, 5),
-      favorability_changes: favorChanges,
-      jealousy_changes: jealChanges,
+      health: delta(-2, 2),
+      mood: delta(-3, 5),
+      trust: delta(-1, 3),
+      friendship: delta(-1, 2),
+      special: delta(0, 5),
+      favorability: favorChanges,
+      jealousy: jealChanges,
     },
     choices: [
-      '【系统建议】主动靠近攻略角色',
-      '【保持沉默】观察他们的互动',
-      '【介入】尝试精神链接',
+      '【系统建议】主动靠近他',
+      '【保持沉默】观察他的反应',
+      '【介入】制造两人独处的机会',
       '【建议】暂时撤退，从长计议'
     ],
   };
